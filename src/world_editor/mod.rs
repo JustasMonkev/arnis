@@ -755,6 +755,16 @@ impl<'a> WorldEditor<'a> {
             .fill_column(x, z, y_min, y_max, block, skip_existing);
     }
 
+    /// Merge precomputed modifications into the in-memory world state.
+    pub(crate) fn merge_modifications(&mut self, other: WorldToModify) {
+        self.world.merge_from(other);
+    }
+
+    /// Consume the editor and return the accumulated in-memory modifications.
+    pub(crate) fn into_modifications(self) -> WorldToModify {
+        self.world
+    }
+
     /// Saves all changes made to the world by writing to the appropriate format.
     ///
     /// Returns `Err` on I/O failure so callers can abort the generation pipeline

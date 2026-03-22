@@ -227,6 +227,35 @@ impl SectionToModify {
         }
     }
 
+    /// Merge another section into this one, only filling positions that are
+    /// still AIR in the target section.
+    pub fn merge_from(&mut self, mut other: SectionToModify) {
+        if matches!(other.storage, BlockStorage::Uniform(AIR)) && other.properties.is_empty() {
+            return;
+        }
+
+        if matches!(self.storage, BlockStorage::Uniform(AIR)) && self.properties.is_empty() {
+            *self = other;
+            return;
+        }
+
+        for idx in 0..4096 {
+            if self.storage.get(idx) != AIR {
+                continue;
+            }
+
+            let src_block = other.storage.get(idx);
+            if src_block == AIR {
+                continue;
+            }
+
+            self.storage.set(idx, src_block);
+            if let Some(props) = other.properties.remove(&idx) {
+                self.properties.insert(idx, props);
+            }
+        }
+    }
+
     /// Convert to Java Edition section format
     pub fn to_section(&self, y: i8) -> Section {
         // Fast path: Uniform section → single palette entry, no data array needed.
@@ -390,6 +419,33 @@ impl RegionToModify {
     pub fn get_chunk(&self, x: i32, z: i32) -> Option<&ChunkToModify> {
         self.chunks.get(&(x, z))
     }
+
+    pub fn merge_from(&mut self, other: RegionToModify) {
+        for (chunk_key, other_chunk) in other.chunks {
+            match self.chunks.entry(chunk_key) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(other_chunk);
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    let target_chunk = entry.get_mut();
+                    for (key, value) in other_chunk.other {
+                        target_chunk.other.entry(key).or_insert(value);
+                    }
+
+                    for (section_y, other_section) in other_chunk.sections {
+                        match target_chunk.sections.entry(section_y) {
+                            std::collections::hash_map::Entry::Vacant(entry) => {
+                                entry.insert(other_section);
+                            }
+                            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                                entry.get_mut().merge_from(other_section);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// The entire world being modified.
@@ -547,6 +603,19 @@ impl WorldToModify {
         }
     }
 
+    pub fn merge_from(&mut self, other: WorldToModify) {
+        for (region_key, other_region) in other.regions {
+            match self.regions.entry(region_key) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(other_region);
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    entry.get_mut().merge_from(other_region);
+                }
+            }
+        }
+    }
+
     /// Scan every section and collapse any that are entirely one block type
     /// from `Full(Vec)` back to `Uniform(Block)`, freeing the 4 KiB allocation.
     pub fn compact_sections(&mut self) {
@@ -559,5 +628,36 @@ impl WorldToModify {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_from_preserves_existing_blocks() {
+        let mut base = WorldToModify::default();
+        base.set_block(8, -62, 8, STONE);
+
+        let mut overlay = WorldToModify::default();
+        overlay.set_block(8, -62, 8, DIRT);
+        overlay.set_block(9, -62, 8, DIRT);
+
+        base.merge_from(overlay);
+
+        assert_eq!(base.get_block(8, -62, 8), Some(STONE));
+        assert_eq!(base.get_block(9, -62, 8), Some(DIRT));
+    }
+
+    #[test]
+    fn merge_from_inserts_new_sections_directly() {
+        let mut base = WorldToModify::default();
+        let mut overlay = WorldToModify::default();
+        overlay.set_block(1, -40, 1, BEDROCK);
+
+        base.merge_from(overlay);
+
+        assert_eq!(base.get_block(1, -40, 1), Some(BEDROCK));
     }
 }

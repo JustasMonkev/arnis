@@ -6,6 +6,7 @@ use super::common::{Chunk, ChunkToModify, Section};
 use super::WorldEditor;
 use crate::block_definitions::GRASS_BLOCK;
 use crate::progress::emit_gui_progress_update;
+use crate::world_utils::JAVA_DATA_VERSION;
 use colored::Colorize;
 use fastanvil::Region;
 use fastnbt::Value;
@@ -21,6 +22,8 @@ use std::sync::{Mutex, OnceLock};
 /// Cached base chunk sections (grass at Y=-62)
 /// Computed once on first use and reused for all empty chunks
 static BASE_CHUNK_SECTIONS: OnceLock<Vec<Section>> = OnceLock::new();
+const DEFAULT_BIOME: &str = "minecraft:plains";
+const DEFAULT_SECTION_Y: i8 = -4;
 
 /// Get or create the cached base chunk sections
 fn get_base_chunk_sections() -> &'static [Section] {
@@ -84,7 +87,7 @@ impl<'a> WorldEditor<'a> {
         };
 
         // Create the Level wrapper
-        let level_data = create_level_wrapper(&chunk_data);
+        let level_data = create_chunk_nbt(&chunk_data);
 
         // Serialize the chunk with Level wrapper
         let mut ser_buffer = Vec::with_capacity(8192);
@@ -193,7 +196,7 @@ impl<'a> WorldEditor<'a> {
                 };
 
                 // Create Level wrapper and save
-                let level_data = create_level_wrapper(&chunk);
+                let level_data = create_chunk_nbt(&chunk);
                 ser_buffer.clear();
                 fastnbt::to_writer(&mut ser_buffer, &level_data)?;
                 region.write_chunk(chunk_x as usize, chunk_z as usize, &ser_buffer)?;
@@ -249,69 +252,109 @@ fn get_entity_coords(entity: &HashMap<String, Value>) -> Option<(i32, i32, i32)>
     Some((x, y, z))
 }
 
-/// Creates a Level wrapper for chunk data (Java Edition format)
+fn create_section_nbt(section: &Section) -> Value {
+    let mut block_states = HashMap::from([(
+        "palette".to_string(),
+        Value::List(
+            section
+                .block_states
+                .palette
+                .iter()
+                .map(|item| {
+                    let mut palette_item =
+                        HashMap::from([("Name".to_string(), Value::String(item.name.clone()))]);
+                    if let Some(props) = &item.properties {
+                        palette_item.insert("Properties".to_string(), props.clone());
+                    }
+                    Value::Compound(palette_item)
+                })
+                .collect(),
+        ),
+    )]);
+
+    if let Some(data) = &section.block_states.data {
+        if !data.is_empty() {
+            block_states.insert("data".to_string(), Value::LongArray(data.to_owned()));
+        }
+    }
+
+    let mut section_map = HashMap::from([
+        ("Y".to_string(), Value::Byte(section.y)),
+        ("block_states".to_string(), Value::Compound(block_states)),
+        (
+            "biomes".to_string(),
+            Value::Compound(HashMap::from([(
+                "palette".to_string(),
+                Value::List(vec![Value::String(DEFAULT_BIOME.to_string())]),
+            )])),
+        ),
+    ]);
+
+    for (key, value) in &section.other {
+        section_map
+            .entry(key.clone())
+            .or_insert_with(|| value.clone());
+    }
+
+    Value::Compound(section_map)
+}
+
+/// Creates a modern top-level chunk compound for Java Edition
 #[inline]
-fn create_level_wrapper(chunk: &Chunk) -> HashMap<String, Value> {
-    let mut level_map = HashMap::from([
+fn create_chunk_nbt(chunk: &Chunk) -> HashMap<String, Value> {
+    let min_section_y = chunk
+        .sections
+        .iter()
+        .map(|section| section.y)
+        .min()
+        .unwrap_or(DEFAULT_SECTION_Y);
+
+    let mut chunk_map = HashMap::from([
+        ("DataVersion".to_string(), Value::Int(JAVA_DATA_VERSION)),
+        (
+            "Status".to_string(),
+            Value::String("minecraft:full".to_string()),
+        ),
         ("xPos".to_string(), Value::Int(chunk.x_pos)),
         ("zPos".to_string(), Value::Int(chunk.z_pos)),
+        ("yPos".to_string(), Value::Int(i32::from(min_section_y))),
+        ("LastUpdate".to_string(), Value::Long(0)),
+        ("InhabitedTime".to_string(), Value::Long(0)),
         (
-            "isLightOn".to_string(),
-            Value::Byte(i8::try_from(chunk.is_light_on).unwrap()),
+            "Heightmaps".to_string(),
+            Value::Compound(HashMap::default()),
         ),
         (
             "sections".to_string(),
-            Value::List(
-                chunk
-                    .sections
-                    .iter()
-                    .map(|section| {
-                        let mut block_states = HashMap::from([(
-                            "palette".to_string(),
-                            Value::List(
-                                section
-                                    .block_states
-                                    .palette
-                                    .iter()
-                                    .map(|item| {
-                                        let mut palette_item = HashMap::from([(
-                                            "Name".to_string(),
-                                            Value::String(item.name.clone()),
-                                        )]);
-                                        if let Some(props) = &item.properties {
-                                            palette_item
-                                                .insert("Properties".to_string(), props.clone());
-                                        }
-                                        Value::Compound(palette_item)
-                                    })
-                                    .collect(),
-                            ),
-                        )]);
-
-                        // Only add the `data` attribute if it's non-empty
-                        // to maintain compatibility with third-party tools like Dynmap
-                        if let Some(data) = &section.block_states.data {
-                            if !data.is_empty() {
-                                block_states
-                                    .insert("data".to_string(), Value::LongArray(data.to_owned()));
-                            }
-                        }
-
-                        Value::Compound(HashMap::from([
-                            ("Y".to_string(), Value::Byte(section.y)),
-                            ("block_states".to_string(), Value::Compound(block_states)),
-                        ]))
-                    })
-                    .collect(),
-            ),
+            Value::List(chunk.sections.iter().map(create_section_nbt).collect()),
+        ),
+        (
+            "block_entities".to_string(),
+            chunk
+                .other
+                .get("block_entities")
+                .cloned()
+                .unwrap_or_else(|| Value::List(Vec::new())),
+        ),
+        (
+            "structures".to_string(),
+            Value::Compound(HashMap::from([
+                ("starts".to_string(), Value::Compound(HashMap::default())),
+                (
+                    "References".to_string(),
+                    Value::Compound(HashMap::default()),
+                ),
+            ])),
         ),
     ]);
 
     for (key, value) in &chunk.other {
-        level_map.insert(key.clone(), value.clone());
+        if key != "block_entities" {
+            chunk_map.insert(key.clone(), value.clone());
+        }
     }
 
-    HashMap::from([("Level".to_string(), Value::Compound(level_map))])
+    chunk_map
 }
 
 /// Merge compound lists (entities, block_entities) from chunk_to_modify into chunk
@@ -355,5 +398,54 @@ fn value_to_i32(value: &Value) -> Option<i32> {
         Value::Float(v) => Some(*v as i32),
         Value::Double(v) => Some(*v as i32),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::world_editor::common::{Blockstates, PaletteItem, Section};
+
+    #[test]
+    fn create_chunk_nbt_uses_modern_root_fields() {
+        let chunk = Chunk {
+            sections: vec![Section {
+                block_states: Blockstates {
+                    palette: vec![PaletteItem {
+                        name: "minecraft:stone".to_string(),
+                        properties: None,
+                    }],
+                    data: None,
+                    other: FnvHashMap::default(),
+                },
+                y: 0,
+                other: FnvHashMap::default(),
+            }],
+            x_pos: 12,
+            z_pos: 34,
+            is_light_on: 0,
+            other: FnvHashMap::default(),
+        };
+
+        let nbt = create_chunk_nbt(&chunk);
+
+        assert_eq!(nbt.get("DataVersion"), Some(&Value::Int(JAVA_DATA_VERSION)));
+        assert_eq!(
+            nbt.get("Status"),
+            Some(&Value::String("minecraft:full".to_string()))
+        );
+        assert!(!nbt.contains_key("Level"));
+
+        let sections = match nbt.get("sections") {
+            Some(Value::List(sections)) => sections,
+            other => panic!("expected sections list, got {other:?}"),
+        };
+
+        let section = match &sections[0] {
+            Value::Compound(section) => section,
+            other => panic!("expected section compound, got {other:?}"),
+        };
+
+        assert!(section.contains_key("biomes"));
     }
 }

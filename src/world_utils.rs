@@ -6,6 +6,30 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::{fs, io::Write};
 
+pub(crate) const JAVA_DATA_VERSION: i32 = 4189;
+pub(crate) const JAVA_VERSION_NAME: &str = "1.21.4";
+
+fn java_version_value() -> Value {
+    Value::Compound(std::collections::HashMap::from([
+        ("Snapshot".to_string(), Value::Byte(0)),
+        ("Series".to_string(), Value::String("main".to_string())),
+        ("Id".to_string(), Value::Int(JAVA_DATA_VERSION)),
+        (
+            "Name".to_string(),
+            Value::String(JAVA_VERSION_NAME.to_string()),
+        ),
+    ]))
+}
+
+pub(crate) fn ensure_java_level_dat_data_fields(
+    data: &mut std::collections::HashMap<String, Value>,
+) {
+    data.entry("DataVersion".to_string())
+        .or_insert(Value::Int(JAVA_DATA_VERSION));
+    data.entry("Version".to_string())
+        .or_insert_with(java_version_value);
+}
+
 /// Returns the Desktop directory for Bedrock .mcworld file output.
 /// Falls back to home directory, then current directory.
 pub fn get_bedrock_output_directory() -> PathBuf {
@@ -137,6 +161,8 @@ pub fn create_new_world(base_path: &Path) -> Result<String, String> {
     // Modify the LevelName, LastPlayed and player position fields
     if let Value::Compound(ref mut root) = level_data {
         if let Some(Value::Compound(ref mut data)) = root.get_mut("Data") {
+            ensure_java_level_dat_data_fields(data);
+
             // Update LevelName
             data.insert("LevelName".to_string(), Value::String(unique_name.clone()));
 
@@ -252,6 +278,7 @@ pub fn set_spawn_in_level_dat(world_path: &Path, spawn_x: i32, spawn_z: i32) -> 
     data.insert("SpawnX".to_string(), Value::Int(spawn_x));
     data.insert("SpawnY".to_string(), Value::Int(spawn_y));
     data.insert("SpawnZ".to_string(), Value::Int(spawn_z));
+    ensure_java_level_dat_data_fields(data);
 
     // Update player position if Player compound exists
     if let Some(Value::Compound(ref mut player)) = data.get_mut("Player") {

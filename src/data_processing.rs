@@ -3,20 +3,22 @@ use crate::block_definitions::{BEDROCK, DIRT, GRASS_BLOCK, SMOOTH_STONE, STONE};
 use crate::coordinate_system::cartesian::XZBBox;
 use crate::coordinate_system::geographic::LLBBox;
 use crate::element_processing::*;
-use crate::floodfill_cache::FloodFillCache;
+use crate::floodfill_cache::{BuildingFootprintBitmap, FloodFillCache};
 use crate::ground::Ground;
 use crate::map_renderer;
-use crate::osm_parser::{ProcessedElement, ProcessedMemberRole};
+use crate::osm_parser::{get_priority, ProcessedElement, ProcessedMemberRole};
 use crate::progress::{emit_gui_progress_update, emit_map_preview_ready, emit_open_mcworld_file};
 #[cfg(feature = "gui")]
 use crate::telemetry::{send_log, LogLevel};
 use crate::urban_ground;
-use crate::world_editor::{WorldEditor, WorldFormat};
+use crate::world_editor::{WorldEditor, WorldFormat, WorldToModify};
 use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
+use rayon::prelude::*;
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 pub const MIN_Y: i32 = -64;
 
@@ -27,6 +29,168 @@ pub struct GenerationOptions {
     pub format: WorldFormat,
     pub level_name: Option<String>,
     pub spawn_point: Option<(i32, i32)>,
+}
+
+const PARALLEL_PRIORITY_THRESHOLD: usize = 1;
+const SEQUENTIAL_PRIORITY_THRESHOLD: usize = 6;
+
+fn should_parallelize_priority(priority: usize) -> bool {
+    (PARALLEL_PRIORITY_THRESHOLD..SEQUENTIAL_PRIORITY_THRESHOLD).contains(&priority)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_one_element(
+    editor: &mut WorldEditor,
+    element: &ProcessedElement,
+    args: &Args,
+    xzbbox: &XZBBox,
+    highway_connectivity: &highways::HighwayConnectivityMap,
+    flood_fill_cache: &FloodFillCache,
+    building_footprints: &BuildingFootprintBitmap,
+    suppressed_building_outlines: &HashSet<u64>,
+) {
+    match element {
+        ProcessedElement::Way(way) => {
+            if way.tags.contains_key("building") || way.tags.contains_key("building:part") {
+                if !suppressed_building_outlines.contains(&way.id) {
+                    buildings::generate_buildings(editor, way, args, None, None, flood_fill_cache);
+                }
+            } else if way.tags.contains_key("highway") {
+                highways::generate_highways(
+                    editor,
+                    element,
+                    args,
+                    highway_connectivity,
+                    flood_fill_cache,
+                );
+            } else if way.tags.contains_key("landuse") {
+                landuse::generate_landuse(editor, way, args, flood_fill_cache, building_footprints);
+            } else if way.tags.contains_key("natural") {
+                natural::generate_natural(
+                    editor,
+                    element,
+                    args,
+                    flood_fill_cache,
+                    building_footprints,
+                );
+            } else if way.tags.contains_key("amenity") {
+                amenities::generate_amenities(editor, element, args, flood_fill_cache);
+            } else if way.tags.contains_key("leisure") {
+                leisure::generate_leisure(editor, way, args, flood_fill_cache, building_footprints);
+            } else if way.tags.contains_key("barrier") {
+                barriers::generate_barriers(editor, element);
+            } else if let Some(val) = way.tags.get("waterway") {
+                if val == "dock" {
+                    water_areas::generate_water_area_from_way(editor, way, xzbbox);
+                } else {
+                    waterways::generate_waterways(editor, way);
+                }
+            } else if way.tags.contains_key("railway") {
+                railways::generate_railways(editor, way);
+            } else if way.tags.contains_key("roller_coaster") {
+                railways::generate_roller_coaster(editor, way);
+            } else if way.tags.contains_key("aeroway") || way.tags.contains_key("area:aeroway") {
+                highways::generate_aeroway(editor, way, args);
+            } else if way.tags.get("service") == Some(&"siding".to_string()) {
+                highways::generate_siding(editor, way);
+            } else if way.tags.get("tomb") == Some(&"pyramid".to_string()) {
+                historic::generate_pyramid(editor, way, args, flood_fill_cache);
+            } else if way.tags.contains_key("man_made") {
+                man_made::generate_man_made(editor, element, args);
+            } else if way.tags.contains_key("power") {
+                power::generate_power(editor, element);
+            } else if way.tags.contains_key("place") {
+                landuse::generate_place(editor, way, args, flood_fill_cache);
+            }
+        }
+        ProcessedElement::Node(node) => {
+            if node.tags.contains_key("door") || node.tags.contains_key("entrance") {
+                doors::generate_doors(editor, node);
+            } else if node.tags.contains_key("natural")
+                && node.tags.get("natural") == Some(&"tree".to_string())
+            {
+                natural::generate_natural(
+                    editor,
+                    element,
+                    args,
+                    flood_fill_cache,
+                    building_footprints,
+                );
+            } else if node.tags.contains_key("amenity") {
+                amenities::generate_amenities(editor, element, args, flood_fill_cache);
+            } else if node.tags.contains_key("barrier") {
+                barriers::generate_barrier_nodes(editor, node);
+            } else if node.tags.contains_key("highway") {
+                highways::generate_highways(
+                    editor,
+                    element,
+                    args,
+                    highway_connectivity,
+                    flood_fill_cache,
+                );
+            } else if node.tags.contains_key("tourism") {
+                tourisms::generate_tourisms(editor, node);
+            } else if node.tags.contains_key("man_made") {
+                man_made::generate_man_made_nodes(editor, node);
+            } else if node.tags.contains_key("power") {
+                power::generate_power_nodes(editor, node);
+            } else if node.tags.contains_key("historic") {
+                historic::generate_historic(editor, node);
+            } else if node.tags.contains_key("emergency") {
+                emergency::generate_emergency(editor, node);
+            } else if node.tags.contains_key("advertising") {
+                advertising::generate_advertising(editor, node);
+            }
+        }
+        ProcessedElement::Relation(rel) => {
+            let is_building_relation = rel.tags.contains_key("building")
+                || rel.tags.contains_key("building:part")
+                || rel.tags.get("type").map(|t| t.as_str()) == Some("building");
+            if is_building_relation {
+                buildings::generate_building_from_relation(
+                    editor,
+                    rel,
+                    args,
+                    flood_fill_cache,
+                    xzbbox,
+                );
+            } else if rel.tags.contains_key("water")
+                || rel
+                    .tags
+                    .get("natural")
+                    .map(|val| val == "water" || val == "bay")
+                    .unwrap_or(false)
+            {
+                water_areas::generate_water_areas_from_relation(editor, rel, xzbbox);
+            } else if rel.tags.contains_key("natural") {
+                natural::generate_natural_from_relation(
+                    editor,
+                    rel,
+                    args,
+                    flood_fill_cache,
+                    building_footprints,
+                );
+            } else if rel.tags.contains_key("landuse") {
+                landuse::generate_landuse_from_relation(
+                    editor,
+                    rel,
+                    args,
+                    flood_fill_cache,
+                    building_footprints,
+                );
+            } else if rel.tags.get("leisure") == Some(&"park".to_string()) {
+                leisure::generate_leisure_from_relation(
+                    editor,
+                    rel,
+                    args,
+                    flood_fill_cache,
+                    building_footprints,
+                );
+            } else if rel.tags.contains_key("man_made") {
+                man_made::generate_man_made(editor, element, args);
+            }
+        }
+    }
 }
 
 /// Generate world with explicit format options (used by GUI for Bedrock support)
@@ -63,8 +227,10 @@ pub fn generate_world_with_options(
     println!("{} Processing terrain...", "[5/7]".bold());
     emit_gui_progress_update(25.0, "Processing terrain...");
 
-    // Pre-compute all flood fills in parallel for better CPU utilization
-    let mut flood_fill_cache = FloodFillCache::precompute(&elements, args.timeout.as_ref());
+    // Pre-compute all flood fills in parallel for better CPU utilization.
+    // This stays immutable during element processing so parallel priority stages
+    // can share it safely.
+    let flood_fill_cache = FloodFillCache::precompute(&elements, args.timeout.as_ref());
 
     // Collect building footprints to prevent trees from spawning inside buildings
     // Uses a memory-efficient bitmap (~1 bit per coordinate) instead of a HashSet (~24 bytes per coordinate)
@@ -86,9 +252,8 @@ pub fn generate_world_with_options(
         .unwrap()
         .progress_chars("█▓░"));
 
-    let progress_increment_prcs: f64 = 45.0 / elements_count as f64;
-    let mut current_progress_prcs: f64 = 25.0;
-    let mut last_emitted_progress: f64 = current_progress_prcs;
+    let processed_elements = AtomicU64::new(0);
+    let progress_lock = Mutex::new((25.0_f64, 25.0_f64));
 
     // Pre-scan: detect building relation outlines that should be suppressed.
     // Only applies to type=building relations (NOT type=multipolygon).
@@ -117,198 +282,109 @@ pub fn generate_world_with_options(
         outlines
     };
 
-    // Process all elements
-    for element in elements.into_iter() {
-        process_pb.inc(1);
-        current_progress_prcs += progress_increment_prcs;
-        if (current_progress_prcs - last_emitted_progress).abs() > 0.25 {
-            emit_gui_progress_update(current_progress_prcs, "");
-            last_emitted_progress = current_progress_prcs;
+    let thread_count = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .max(1);
+
+    let mut bucket_start = 0usize;
+    while bucket_start < elements.len() {
+        let priority = get_priority(&elements[bucket_start]);
+        let mut bucket_end = bucket_start + 1;
+        while bucket_end < elements.len() && get_priority(&elements[bucket_end]) == priority {
+            bucket_end += 1;
         }
 
-        if args.debug {
-            process_pb.set_message(format!(
-                "(Element ID: {} / Type: {})",
-                element.id(),
-                element.kind()
-            ));
-        } else {
-            process_pb.set_message("");
-        }
+        let bucket = &elements[bucket_start..bucket_end];
 
-        match &element {
-            ProcessedElement::Way(way) => {
-                if way.tags.contains_key("building") || way.tags.contains_key("building:part") {
-                    // Skip building outlines that are suppressed by building relations with parts.
-                    // The individual building:part ways will render instead.
-                    if !suppressed_building_outlines.contains(&way.id) {
-                        buildings::generate_buildings(
-                            &mut editor,
-                            way,
-                            args,
-                            None,
-                            None,
-                            &flood_fill_cache,
-                        );
-                    }
-                } else if way.tags.contains_key("highway") {
-                    highways::generate_highways(
-                        &mut editor,
-                        &element,
+        if should_parallelize_priority(priority) && bucket.len() > 1 {
+            let batch_count = (thread_count * 2).min(bucket.len()).max(1);
+            let batch_size = bucket.len().div_ceil(batch_count);
+            let batched_world = Mutex::new(WorldToModify::default());
+
+            bucket.par_chunks(batch_size).for_each(|batch| {
+                let mut local_editor = WorldEditor::new_with_format_and_name(
+                    PathBuf::new(),
+                    &xzbbox,
+                    llbbox,
+                    world_format,
+                    None,
+                    None,
+                );
+                local_editor.set_ground(Arc::clone(&ground));
+
+                for element in batch {
+                    process_one_element(
+                        &mut local_editor,
+                        element,
                         args,
-                        &highway_connectivity,
-                        &flood_fill_cache,
-                    );
-                } else if way.tags.contains_key("landuse") {
-                    landuse::generate_landuse(
-                        &mut editor,
-                        way,
-                        args,
-                        &flood_fill_cache,
-                        &building_footprints,
-                    );
-                } else if way.tags.contains_key("natural") {
-                    natural::generate_natural(
-                        &mut editor,
-                        &element,
-                        args,
-                        &flood_fill_cache,
-                        &building_footprints,
-                    );
-                } else if way.tags.contains_key("amenity") {
-                    amenities::generate_amenities(&mut editor, &element, args, &flood_fill_cache);
-                } else if way.tags.contains_key("leisure") {
-                    leisure::generate_leisure(
-                        &mut editor,
-                        way,
-                        args,
-                        &flood_fill_cache,
-                        &building_footprints,
-                    );
-                } else if way.tags.contains_key("barrier") {
-                    barriers::generate_barriers(&mut editor, &element);
-                } else if let Some(val) = way.tags.get("waterway") {
-                    if val == "dock" {
-                        // docks count as water areas
-                        water_areas::generate_water_area_from_way(&mut editor, way, &xzbbox);
-                    } else {
-                        waterways::generate_waterways(&mut editor, way);
-                    }
-                } else if way.tags.contains_key("bridge") {
-                    //bridges::generate_bridges(&mut editor, way, ground_level); // TODO FIX
-                } else if way.tags.contains_key("railway") {
-                    railways::generate_railways(&mut editor, way);
-                } else if way.tags.contains_key("roller_coaster") {
-                    railways::generate_roller_coaster(&mut editor, way);
-                } else if way.tags.contains_key("aeroway") || way.tags.contains_key("area:aeroway")
-                {
-                    highways::generate_aeroway(&mut editor, way, args);
-                } else if way.tags.get("service") == Some(&"siding".to_string()) {
-                    highways::generate_siding(&mut editor, way);
-                } else if way.tags.get("tomb") == Some(&"pyramid".to_string()) {
-                    historic::generate_pyramid(&mut editor, way, args, &flood_fill_cache);
-                } else if way.tags.contains_key("man_made") {
-                    man_made::generate_man_made(&mut editor, &element, args);
-                } else if way.tags.contains_key("power") {
-                    power::generate_power(&mut editor, &element);
-                } else if way.tags.contains_key("place") {
-                    landuse::generate_place(&mut editor, way, args, &flood_fill_cache);
-                }
-                // Release flood fill cache entry for this way
-                flood_fill_cache.remove_way(way.id);
-            }
-            ProcessedElement::Node(node) => {
-                if node.tags.contains_key("door") || node.tags.contains_key("entrance") {
-                    doors::generate_doors(&mut editor, node);
-                } else if node.tags.contains_key("natural")
-                    && node.tags.get("natural") == Some(&"tree".to_string())
-                {
-                    natural::generate_natural(
-                        &mut editor,
-                        &element,
-                        args,
-                        &flood_fill_cache,
-                        &building_footprints,
-                    );
-                } else if node.tags.contains_key("amenity") {
-                    amenities::generate_amenities(&mut editor, &element, args, &flood_fill_cache);
-                } else if node.tags.contains_key("barrier") {
-                    barriers::generate_barrier_nodes(&mut editor, node);
-                } else if node.tags.contains_key("highway") {
-                    highways::generate_highways(
-                        &mut editor,
-                        &element,
-                        args,
-                        &highway_connectivity,
-                        &flood_fill_cache,
-                    );
-                } else if node.tags.contains_key("tourism") {
-                    tourisms::generate_tourisms(&mut editor, node);
-                } else if node.tags.contains_key("man_made") {
-                    man_made::generate_man_made_nodes(&mut editor, node);
-                } else if node.tags.contains_key("power") {
-                    power::generate_power_nodes(&mut editor, node);
-                } else if node.tags.contains_key("historic") {
-                    historic::generate_historic(&mut editor, node);
-                } else if node.tags.contains_key("emergency") {
-                    emergency::generate_emergency(&mut editor, node);
-                } else if node.tags.contains_key("advertising") {
-                    advertising::generate_advertising(&mut editor, node);
-                }
-            }
-            ProcessedElement::Relation(rel) => {
-                let is_building_relation = rel.tags.contains_key("building")
-                    || rel.tags.contains_key("building:part")
-                    || rel.tags.get("type").map(|t| t.as_str()) == Some("building");
-                if is_building_relation {
-                    buildings::generate_building_from_relation(
-                        &mut editor,
-                        rel,
-                        args,
-                        &flood_fill_cache,
                         &xzbbox,
-                    );
-                } else if rel.tags.contains_key("water")
-                    || rel
-                        .tags
-                        .get("natural")
-                        .map(|val| val == "water" || val == "bay")
-                        .unwrap_or(false)
-                {
-                    water_areas::generate_water_areas_from_relation(&mut editor, rel, &xzbbox);
-                } else if rel.tags.contains_key("natural") {
-                    natural::generate_natural_from_relation(
-                        &mut editor,
-                        rel,
-                        args,
+                        &highway_connectivity,
                         &flood_fill_cache,
                         &building_footprints,
+                        &suppressed_building_outlines,
                     );
-                } else if rel.tags.contains_key("landuse") {
-                    landuse::generate_landuse_from_relation(
-                        &mut editor,
-                        rel,
-                        args,
-                        &flood_fill_cache,
-                        &building_footprints,
-                    );
-                } else if rel.tags.get("leisure") == Some(&"park".to_string()) {
-                    leisure::generate_leisure_from_relation(
-                        &mut editor,
-                        rel,
-                        args,
-                        &flood_fill_cache,
-                        &building_footprints,
-                    );
-                } else if rel.tags.contains_key("man_made") {
-                    man_made::generate_man_made(&mut editor, &element, args);
                 }
-                // Release flood fill cache entries for all ways in this relation
-                let way_ids: Vec<u64> = rel.members.iter().map(|m| m.way.id).collect();
-                flood_fill_cache.remove_relation_ways(&way_ids);
+
+                let mut merged_world = batched_world
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                merged_world.merge_from(local_editor.into_modifications());
+
+                let done = processed_elements.fetch_add(batch.len() as u64, Ordering::Relaxed)
+                    + batch.len() as u64;
+                process_pb.inc(batch.len() as u64);
+                let mut progress = progress_lock
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                progress.0 = 25.0 + (done as f64 / elements_count as f64) * 45.0;
+                if (progress.0 - progress.1).abs() > 0.25 {
+                    emit_gui_progress_update(progress.0, "");
+                    progress.1 = progress.0;
+                }
+            });
+
+            let batched_world = batched_world
+                .into_inner()
+                .unwrap_or_else(|poison| poison.into_inner());
+            editor.merge_modifications(batched_world);
+        } else {
+            for element in bucket {
+                if args.debug {
+                    process_pb.set_message(format!(
+                        "(Element ID: {} / Type: {})",
+                        element.id(),
+                        element.kind()
+                    ));
+                } else {
+                    process_pb.set_message("");
+                }
+
+                process_one_element(
+                    &mut editor,
+                    element,
+                    args,
+                    &xzbbox,
+                    &highway_connectivity,
+                    &flood_fill_cache,
+                    &building_footprints,
+                    &suppressed_building_outlines,
+                );
+
+                let done = processed_elements.fetch_add(1, Ordering::Relaxed) + 1;
+                process_pb.inc(1);
+                let mut progress = progress_lock
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                progress.0 = 25.0 + (done as f64 / elements_count as f64) * 45.0;
+                if (progress.0 - progress.1).abs() > 0.25 {
+                    emit_gui_progress_update(progress.0, "");
+                    progress.1 = progress.0;
+                }
             }
         }
-        // Element is dropped here, freeing its memory immediately
+
+        bucket_start = bucket_end;
     }
 
     process_pb.finish();
@@ -327,28 +403,8 @@ pub fn generate_world_with_options(
     drop(highway_connectivity);
     drop(flood_fill_cache);
 
-    // Generate ground layer
-    let total_blocks: u64 = xzbbox.bounding_rect().total_blocks();
-    let desired_updates: u64 = 1500;
-    let batch_size: u64 = (total_blocks / desired_updates).max(1);
-
-    let mut block_counter: u64 = 0;
-
     println!("{} Generating ground...", "[6/7]".bold());
     emit_gui_progress_update(70.0, "Generating ground...");
-
-    let ground_pb: ProgressBar = ProgressBar::new(total_blocks);
-    ground_pb.set_style(
-        ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:45}] {pos}/{len} blocks ({eta})")
-            .unwrap()
-            .progress_chars("█▓░"),
-    );
-
-    let mut gui_progress_grnd: f64 = 70.0;
-    let mut last_emitted_progress: f64 = gui_progress_grnd;
-    let total_iterations_grnd: f64 = total_blocks as f64;
-    let progress_increment_grnd: f64 = 20.0 / total_iterations_grnd;
 
     // Check if terrain elevation is enabled; when disabled, we can skip ground level lookups entirely
     let terrain_enabled = ground.elevation_enabled;
@@ -361,69 +417,85 @@ pub fn generate_world_with_options(
     let min_chunk_z = xzbbox.min_z() >> 4;
     let max_chunk_z = xzbbox.max_z() >> 4;
 
-    for chunk_x in min_chunk_x..=max_chunk_x {
-        for chunk_z in min_chunk_z..=max_chunk_z {
-            // Calculate the block range for this chunk, clamped to bbox
-            let chunk_min_x = (chunk_x << 4).max(xzbbox.min_x());
-            let chunk_max_x = ((chunk_x << 4) + 15).min(xzbbox.max_x());
-            let chunk_min_z = (chunk_z << 4).max(xzbbox.min_z());
-            let chunk_max_z = ((chunk_z << 4) + 15).min(xzbbox.max_z());
+    let total_chunks: u64 =
+        ((max_chunk_x - min_chunk_x + 1) as u64) * ((max_chunk_z - min_chunk_z + 1) as u64);
+    let progress_update_interval = (total_chunks / 80).max(1);
+    let ground_pb: ProgressBar = ProgressBar::new(total_chunks);
+    ground_pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:45}] {pos}/{len} chunks ({eta})")
+            .unwrap()
+            .progress_chars("█▓░"),
+    );
 
-            for x in chunk_min_x..=chunk_max_x {
-                for z in chunk_min_z..=chunk_max_z {
-                    // Get ground level, when terrain is enabled, look it up once per block
-                    // When disabled, use constant ground_level (no function call overhead)
-                    let ground_y = if terrain_enabled {
-                        editor.get_ground_level(x, z)
-                    } else {
-                        args.ground_level
-                    };
+    let chunk_coords: Vec<(i32, i32)> = (min_chunk_x..=max_chunk_x)
+        .flat_map(|chunk_x| (min_chunk_z..=max_chunk_z).map(move |chunk_z| (chunk_x, chunk_z)))
+        .collect();
+    let editor_view = &editor;
+    let ground_world = Mutex::new(WorldToModify::default());
+    let chunks_done = AtomicU64::new(0);
 
-                    // Check if this coordinate is in an urban area (O(1) lookup)
-                    let is_urban = has_urban_ground && urban_lookup.is_urban(x, z);
+    chunk_coords.into_par_iter().for_each(|(chunk_x, chunk_z)| {
+        let mut local_world = WorldToModify::default();
 
-                    // Add default dirt and grass layer if there isn't a stone layer already
-                    if !editor.check_for_block_absolute(x, ground_y, z, Some(&[STONE]), None) {
-                        if is_urban {
-                            // Urban area: smooth stone ground
-                            editor.set_block_if_absent_absolute(SMOOTH_STONE, x, ground_y, z);
-                        } else {
-                            // Rural/natural area: grass and dirt
-                            editor.set_block_if_absent_absolute(GRASS_BLOCK, x, ground_y, z);
+        // Calculate the block range for this chunk, clamped to bbox
+        let chunk_min_x = (chunk_x << 4).max(xzbbox.min_x());
+        let chunk_max_x = ((chunk_x << 4) + 15).min(xzbbox.max_x());
+        let chunk_min_z = (chunk_z << 4).max(xzbbox.min_z());
+        let chunk_max_z = ((chunk_z << 4) + 15).min(xzbbox.max_z());
+
+        for x in chunk_min_x..=chunk_max_x {
+            for z in chunk_min_z..=chunk_max_z {
+                let ground_y = if terrain_enabled {
+                    editor_view.get_ground_level(x, z)
+                } else {
+                    args.ground_level
+                };
+
+                let is_urban = has_urban_ground && urban_lookup.is_urban(x, z);
+
+                if !editor_view.check_for_block_absolute(x, ground_y, z, Some(&[STONE]), None) {
+                    let surface_block = if is_urban { SMOOTH_STONE } else { GRASS_BLOCK };
+
+                    if !editor_view.block_at_absolute(x, ground_y, z) {
+                        local_world.set_block(x, ground_y, z, surface_block);
+                    }
+                    if !editor_view.block_at_absolute(x, ground_y - 1, z) {
+                        local_world.set_block(x, ground_y - 1, z, DIRT);
+                    }
+                    if !editor_view.block_at_absolute(x, ground_y - 2, z) {
+                        local_world.set_block(x, ground_y - 2, z, DIRT);
+                    }
+                }
+
+                if args.fillground {
+                    for y in (MIN_Y + 1)..=(ground_y - 3) {
+                        if !editor_view.block_at_absolute(x, y, z) {
+                            local_world.set_block(x, y, z, STONE);
                         }
-                        editor.set_block_if_absent_absolute(DIRT, x, ground_y - 1, z);
-                        editor.set_block_if_absent_absolute(DIRT, x, ground_y - 2, z);
                     }
+                }
 
-                    // Fill underground with stone
-                    if args.fillground {
-                        editor.fill_column_absolute(
-                            STONE,
-                            x,
-                            z,
-                            MIN_Y + 1,
-                            ground_y - 3,
-                            true, // skip_existing: don't overwrite blocks placed by element processing
-                        );
-                    }
-                    // Generate a bedrock level at MIN_Y
-                    editor.set_block_absolute(BEDROCK, x, MIN_Y, z, None, Some(&[BEDROCK]));
-
-                    block_counter += 1;
-                    #[allow(clippy::manual_is_multiple_of)]
-                    if block_counter % batch_size == 0 {
-                        ground_pb.inc(batch_size);
-                    }
-
-                    gui_progress_grnd += progress_increment_grnd;
-                    if (gui_progress_grnd - last_emitted_progress).abs() > 0.25 {
-                        emit_gui_progress_update(gui_progress_grnd, "");
-                        last_emitted_progress = gui_progress_grnd;
-                    }
+                if !editor_view.check_for_block_absolute(x, MIN_Y, z, Some(&[BEDROCK]), None) {
+                    local_world.set_block(x, MIN_Y, z, BEDROCK);
                 }
             }
         }
-    }
+
+        if !local_world.regions.is_empty() {
+            let mut merged_world = ground_world
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            merged_world.merge_from(local_world);
+        }
+
+        let done = chunks_done.fetch_add(1, Ordering::Relaxed) + 1;
+        ground_pb.inc(1);
+        if done.is_multiple_of(progress_update_interval) || done == total_chunks {
+            let progress = 70.0 + (done as f64 / total_chunks as f64) * 20.0;
+            emit_gui_progress_update(progress, "");
+        }
+    });
 
     // Set sign for player orientation
     /*editor.set_sign(
@@ -437,8 +509,11 @@ pub fn generate_world_with_options(
         6,
     );*/
 
-    ground_pb.inc(block_counter % batch_size);
     ground_pb.finish();
+    let ground_world = ground_world
+        .into_inner()
+        .unwrap_or_else(|poison| poison.into_inner());
+    editor.merge_modifications(ground_world);
 
     // Save world
     if let Err(e) = editor.save() {
@@ -552,4 +627,21 @@ pub fn start_map_preview_generation(info: MapPreviewInfo) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_parallelize_priority;
+
+    #[test]
+    fn priority_parallelization_matches_staged_plan() {
+        assert!(!should_parallelize_priority(0));
+        assert!(should_parallelize_priority(1));
+        assert!(should_parallelize_priority(2));
+        assert!(should_parallelize_priority(3));
+        assert!(should_parallelize_priority(4));
+        assert!(should_parallelize_priority(5));
+        assert!(!should_parallelize_priority(6));
+        assert!(!should_parallelize_priority(7));
+    }
 }

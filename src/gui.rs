@@ -11,6 +11,7 @@ use crate::retrieve_data;
 use crate::telemetry::{self, send_log, LogLevel};
 use crate::version_check;
 use crate::world_editor::WorldFormat;
+use crate::world_utils::ensure_java_level_dat_data_fields;
 use colored::Colorize;
 use fastnbt::Value;
 use flate2::read::GzDecoder;
@@ -305,6 +306,7 @@ fn add_localized_world_name(world_path: PathBuf, bbox: &LLBBox) -> PathBuf {
                 // Update the level name in NBT data
                 if let Value::Compound(ref mut root) = nbt_data {
                     if let Some(Value::Compound(ref mut data)) = root.get_mut("Data") {
+                        ensure_java_level_dat_data_fields(data);
                         data.insert("LevelName".to_string(), Value::String(new_name));
 
                         // Save the updated NBT data
@@ -380,6 +382,7 @@ fn set_player_spawn_in_level_dat(
     // Update player position and world spawn point
     if let Value::Compound(ref mut root) = nbt_data {
         if let Some(Value::Compound(ref mut data)) = root.get_mut("Data") {
+            ensure_java_level_dat_data_fields(data);
             // Set world spawn point
             data.insert("SpawnX".to_string(), Value::Int(spawn_x));
             data.insert("SpawnY".to_string(), Value::Int(y as i32));
@@ -515,6 +518,7 @@ pub fn update_player_spawn_y_after_generation(
     // Update player position and world spawn point
     if let Value::Compound(ref mut root) = nbt_data {
         if let Some(Value::Compound(ref mut data)) = root.get_mut("Data") {
+            ensure_java_level_dat_data_fields(data);
             // Only update the Y coordinate, keep existing X and Z
             data.insert("SpawnY".to_string(), Value::Int(spawn_y));
 

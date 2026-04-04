@@ -54,7 +54,11 @@ final class ModelManager: ObservableObject {
         do {
             try FileManager.default.createDirectory(at: modelDirectory, withIntermediateDirectories: true)
 
-            let downloadURL = URL(string: "\(Self.modelRepoURL)/\(Self.modelFileName)")!
+            guard let downloadURL = URL(string: "\(Self.modelRepoURL)/\(Self.modelFileName)") else {
+                state = .error("Invalid model download URL")
+                return
+            }
+
             let delegate = DownloadProgressDelegate { [weak self] progress in
                 Task { @MainActor in
                     self?.state = .downloading(progress: progress)
@@ -95,14 +99,20 @@ final class ModelManager: ObservableObject {
 
         state = .loading
 
-        do {
-            let options = LlmInference.Options(modelPath: localModelPath.path)
-            options.maxTokens = 512
-            options.topk = 40
-            options.temperature = 0.0  // Deterministic for function calling
-            options.randomSeed = 42
+        let modelPath = localModelPath.path
 
-            llmInference = try LlmInference(options: options)
+        do {
+            // Load the model off the main thread since it's CPU-intensive.
+            let inference = try await Task.detached {
+                let options = LlmInference.Options(modelPath: modelPath)
+                options.maxTokens = 512
+                options.topk = 40
+                options.temperature = 0.0  // Deterministic for function calling
+                options.randomSeed = 42
+                return try LlmInference(options: options)
+            }.value
+
+            llmInference = inference
             state = .ready
         } catch {
             state = .error("Failed to load model: \(error.localizedDescription)")
@@ -121,7 +131,11 @@ final class ModelManager: ObservableObject {
         state = .generating
 
         do {
-            let response = try inference.generateResponse(inputText: prompt)
+            // Run inference on a background thread to keep UI responsive.
+            let response = try await Task.detached {
+                try inference.generateResponse(inputText: prompt)
+            }.value
+
             state = .ready
             lastResponse = response
             return response
@@ -155,11 +169,16 @@ final class ModelManager: ObservableObject {
         }
     }
 
-    /// Resets the model session.
+    /// Resets the model session and reloads from disk if available.
     func reset() {
         llmInference = nil
-        state = .idle
         lastResponse = ""
+
+        if isModelDownloaded {
+            Task { await loadModel() }
+        } else {
+            state = .idle
+        }
     }
 }
 

@@ -105,10 +105,14 @@ enum PromptFormatter {
         return decl
     }
 
+    private static let dateFormatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withFullDate, .withFullTime, .withDashSeparatorInDate, .withColonSeparatorInTime]
+        return formatter
+    }()
+
     /// Builds the full prompt with system context, function declarations, and user query.
     static func buildPrompt(userQuery: String) -> String {
-        let dateFormatter = ISO8601DateFormatter()
-        dateFormatter.formatOptions = [.withFullDate, .withFullTime, .withDashSeparatorInDate, .withColonSeparatorInTime]
         let currentDateTime = dateFormatter.string(from: Date())
             .replacingOccurrences(of: "Z", with: "")
 
